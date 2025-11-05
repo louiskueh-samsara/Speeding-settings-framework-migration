@@ -91,14 +91,21 @@ Create feature config to control resolution strategy (framework vs legacy):
 
 #### 2.2 Implement Delegated Resolver
 
-Create delegated resolver to interface with legacy storage:
+Create delegated resolver to interface with legacy storage. **Initial scope: current settings only; historical queries deferred.**
 
-- Define `DelegatedResolver[SpeedingSettings]` with `GetOrgSettings` and `GetDeviceSettings` functions
+**Core Implementation:**
+- Define `DelegatedResolver[SpeedingSettings]` in `go/src/samsaradev.io/platform/settings/generated/safetyeventingestionandfiltering/delegatedresolvers/`
+- Implement two primary methods: `GetOrgSettings` and `GetDeviceSettings`
 - Lift-n-shift existing read logic from `speedingsettingsaccessor.Accessor` into resolver functions
 - Map legacy proto structures to new Settings Framework schema types
 - Handle device/org hierarchy merging logic within resolver
 - Maintain unit conversion logic (milliknots handling)
 - Preserve feature flag checks for inbox defaults and other behaviors
+
+**Deferred Methods:**
+- Historical queries: `GetHistoricalOrgSettings`, `GetHistoricalDeviceSettings` return "not implemented" errors
+- Driver/Address settings: Return empty (not currently supported for speeding)
+- Batch operations: Not needed initially (current usage patterns fetch one at a time)
 
 Example structure:
 
@@ -146,13 +153,24 @@ Services to update:
 - Config push generation
 - Any other consumers of speeding settings
 
-#### 2.4 Handle Historical Queries
+#### 2.4 Handle Historical Queries (Deferred)
 
+**Initial Implementation:**
+- Implement only current settings: `GetOrgSettings` and `GetDeviceSettings`
+- Historical methods return "not implemented" errors
+- Services continue using legacy accessor for historical queries during transition
+
+**Future Work:**
 For time-based queries (e.g., `GetSpeedingSettingsAtTimeMs`):
-
 - Settings Framework has built-in temporal support via `settingsclient.Timestamp`
 - Update historical query logic to use Settings Framework temporal APIs
 - Ensure delegated resolver handles historical fallback to legacy storage
+
+**Rationale for deferring:**
+- Historical queries are complex and require understanding Settings Framework's temporal data model
+- Most critical path is current settings (used for real-time event processing, config generation)
+- Legacy accessor can continue serving historical queries without blocking migration progress
+- Can be added incrementally after current settings are stable
 
 #### 2.5 Testing Read Path
 
