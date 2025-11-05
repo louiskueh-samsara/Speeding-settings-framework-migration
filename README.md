@@ -1,5 +1,3 @@
-# Speeding-settings-framework-migration
-
 <!-- b0228c3e-9bba-4e47-901c-31b84ccbb585 8449186c-c95e-47bd-8d36-f70bf26ead88 -->
 # Speeding Settings Framework Migration
 
@@ -81,13 +79,65 @@ Create `/go/src/samsaradev.io/platform/settings/settingsregistry/speeding_settin
 
 ### Phase 2: Backend Read Path Migration
 
-Update services to use Settings Framework client instead of legacy accessors:
+Migrate read paths to use Settings Framework client with delegated resolver pattern. This enables gradual migration with zero downtime - the delegated resolver provides seamless fallback to legacy storage while allowing Settings Framework to serve migrated data. Feature flag controls which path is used without requiring code changes.
 
-- Update `speedingsettingsaccessor.Accessor.GetActiveOrgSpeedingSettings` to call Settings Framework
-- Update `speedingsettingsaccessor.Accessor.GetSpeedingSettingsAtTimeMs` for historical queries
-- Maintain device/org hierarchy merging logic (now handled by Settings Framework)
-- Keep feature flag checks for inbox defaults and other behaviors
-- Update unit conversion logic (milliknots handling)
+#### 2.1 Define Feature Config
+
+Create feature config to control resolution strategy (framework vs legacy):
+
+- Add `speeding_settings_use_framework` feature flag in appropriate feature config file
+- Feature flag will gate whether Settings Framework or legacy database is used
+- Settings client will evaluate this flag automatically - no need to check it in application code
+
+#### 2.2 Implement Delegated Resolver
+
+Create delegated resolver to interface with legacy storage:
+
+- Define `DelegatedResolver[SpeedingSettings]` with `GetOrgSettings` and `GetDeviceSettings` functions
+- Lift-n-shift existing read logic from `speedingsettingsaccessor.Accessor` into resolver functions
+- Map legacy proto structures to new Settings Framework schema types
+- Handle device/org hierarchy merging logic within resolver
+- Maintain unit conversion logic (milliknots handling)
+- Preserve feature flag checks for inbox defaults and other behaviors
+
+Example structure:
+
+```go
+speedingSettingsResolver := settingsclient.DelegatedResolver[speeding.SpeedingSettings]{
+    GetOrgSettings: func() (*speeding.SpeedingSettings, error) {
+        // Lift from speedingsettingsaccessor.GetActiveOrgSpeedingSettings
+        // Map orgproto.SpeedingSettings -> speeding.SpeedingSettings
+        return mappedSettings, nil
+    },
+    GetDeviceSettings: func() (*speeding.SpeedingSettings, error) {
+        // Lift from device-level accessor logic
+        // Map device proto -> speeding.SpeedingSettings
+        return mappedSettings, nil
+    },
+}
+```
+
+#### 2.3 Update Read Path Call Sites
+
+Replace direct accessor calls with Settings Framework client:
+
+**Before:**
+```go
+settings, err := speedingsettingsaccessor.GetActiveOrgSpeedingSettings(ctx, orgId, deviceId)
+```
+
+**After:**
+```go
+settings, err := settingsClient.GetSettings(ctx, &settingsclient.GetSettingsRequest[speeding.SpeedingSettings]{
+    Id: &settingsclient.Id{
+        OrgId: uint64(orgId),
+        EntityId: &settingsclient.EntityId{
+            Type: settingsclient.EntityTypeDevice,
+            Id:   uint64(deviceId),
+        },
+    },
+}, speedingSettingsResolver)
+```
 
 Services to update:
 
@@ -95,6 +145,22 @@ Services to update:
 - Safety score calculations  
 - Config push generation
 - Any other consumers of speeding settings
+
+#### 2.4 Handle Historical Queries
+
+For time-based queries (e.g., `GetSpeedingSettingsAtTimeMs`):
+
+- Settings Framework has built-in temporal support via `settingsclient.Timestamp`
+- Update historical query logic to use Settings Framework temporal APIs
+- Ensure delegated resolver handles historical fallback to legacy storage
+
+#### 2.5 Testing Read Path
+
+- Port existing data-mocking tests to delegated resolver
+- Refactor unit tests to use settings client mocking instead of legacy accessor mocking
+- Unit tests should NOT distinguish between legacy/framework resolution
+- Add tests to verify feature flag controls resolution path
+- Verify device/org hierarchy merging produces identical results
 
 ### Phase 3: Backend Write Path Migration
 
@@ -126,27 +192,53 @@ Update React components to use new GraphQL schema:
 
 ### Phase 6: Data Migration
 
-Handle existing data in legacy tables:
+Handle existing data in legacy tables. The delegated resolver enables flexible migration strategies:
 
-- Option A: One-time migration script to copy all existing settings to Settings Framework
-- Option B: Lazy migration - keep legacy storage, use default values from schema for orgs without migrated data
-- Option C: Feature-flagged hybrid - use legacy for some orgs, new framework for others during rollout
+- **Option A**: One-time migration script to copy all existing settings to Settings Framework
+- **Option B**: Lazy migration - keep legacy storage, delegated resolver serves unmigrated data seamlessly
+- **Option C**: Feature-flagged hybrid - use legacy for some orgs, new framework for others during rollout
 
 Recommend **Option B** (lazy migration) for safety:
 
+- Delegated resolver automatically serves legacy data when Settings Framework has no data
 - New updates go to Settings Framework only
-- Historical reads can still access legacy storage if needed
+- Historical reads leverage `IsMigrated` flag in setting metadata
 - Gradual natural migration as orgs update settings
+- No coordination needed between read and write path migrations
 
 ### Phase 7: Testing & Validation
 
-- Unit tests for Settings Framework client usage
-- Integration tests for org/device hierarchy
+**Unit Tests:**
+
+- Port existing data-mocking tests for delegated resolver
+- Refactor tests to mock settings client instead of legacy accessors
+- Tests should NOT distinguish between legacy/framework resolution
+- Verify feature flag properly controls resolution strategy
+- Test org/device hierarchy merging produces identical results
+
+**Integration Tests:**
+
+- Verify Settings Framework client with delegated resolver end-to-end
+- Test fallback behavior when settings not yet migrated
+- Validate historical settings queries with temporal support
+- Test that feature flag toggle switches between framework/legacy smoothly
+
+**GraphQL & API Tests:**
+
 - GraphQL mutation/query tests
-- Frontend E2E tests for settings CRUD
 - Verify config push triggers work correctly
-- Validate historical settings queries
-- Performance testing (ensure no regression)
+- Test API compatibility with existing consumers
+
+**Frontend Tests:**
+
+- E2E tests for settings CRUD operations
+- Verify UI behavior unchanged from user perspective
+
+**Performance & Monitoring:**
+
+- Benchmark settings read latency (framework vs legacy)
+- Monitor settings access patterns after deployment
+- Ensure no performance regression from delegated resolver overhead
 
 ### Phase 8: Cleanup (Post-Migration)
 
@@ -161,14 +253,17 @@ After full rollout and verification:
 
 **New files:**
 
-- `go/src/samsaradev.io/platform/settings/settingsregistry/speeding_settings_schema.go`
+- `go/src/samsaradev.io/platform/settings/settingsregistry/speeding_settings_schema.go` - schema definition
+- `go/src/samsaradev.io/safety/safetyaccessors/speedingsettingsaccessor/delegated_resolver.go` - delegated resolver implementation
 - Generated: `settings/generated/safety/graphql/speeding_settings_server.go`
 - Generated: `settings/generated/safety/speeding_settings.go`
 
 **Files to modify:**
 
-- `go/src/samsaradev.io/safety/safetyaccessors/speedingsettingsaccessor/accessor.go`
+- Feature config file (add `speeding_settings_use_framework` flag)
+- `go/src/samsaradev.io/safety/safetyaccessors/speedingsettingsaccessor/accessor.go` - update to use settings client
 - `go/src/samsaradev.io/safety/gql/gqlsafetysetting/speeding.go`
+- All services consuming speeding settings (event processing, score calculations, config push, etc.)
 - `client/pages/org_config/safety/speeding_settings/speeding_settings.tsx`
 - `client/pages/org_config/safety/speeding_settings/org_fragments.graphql`
 - `client/pages/org_config/safety/speeding_settings/individual_speeding_settings.tsx`
@@ -181,17 +276,40 @@ After full rollout and verification:
 
 ## Risks & Mitigations
 
-**Risk**: Data inconsistency during migration
-**Mitigation**: Use feature flags, canary rollout, maintain legacy read paths initially
+**Risk**: Data inconsistency during migration  
+**Mitigation**: Use feature flags, canary rollout, delegated resolver ensures legacy data always accessible during transition
 
-**Risk**: Performance regression from framework overhead
-**Mitigation**: Benchmark before/after, leverage Settings Framework batch APIs
+**Risk**: Performance regression from framework overhead  
+**Mitigation**: Benchmark before/after, leverage Settings Framework batch APIs, monitor read latency metrics
 
-**Risk**: Breaking changes to GraphQL schema
-**Mitigation**: Version GraphQL carefully, coordinate with frontend team
+**Risk**: Breaking changes to GraphQL schema  
+**Mitigation**: Version GraphQL carefully, coordinate with frontend team, maintain backward compatibility
 
-**Risk**: Config push behavior changes
+**Risk**: Config push behavior changes  
 **Mitigation**: Thoroughly test TriggerConfigPushOnUpdate with device configs
+
+**Risk**: Read path migration breaks existing functionality  
+**Mitigation**: Delegated resolver provides exact same logic as legacy accessor, comprehensive test coverage
+
+## Rollback Strategy
+
+The delegated resolver pattern with feature flags provides safe rollback capability:
+
+**Immediate Rollback:**
+- Toggle `speeding_settings_use_framework` feature flag to `false`
+- Settings client automatically falls back to legacy resolution via delegated resolver
+- No code deployment required for rollback
+
+**Canary Rollout:**
+- Enable feature flag for subset of orgs initially
+- Monitor metrics: read latency, error rates, config push success
+- Gradually increase rollout percentage based on metrics
+- Instant rollback for problematic orgs by toggling flag
+
+**Post-Migration Validation:**
+- After all orgs migrate and stabilize, prepare to remove delegated resolver
+- Ensure Settings Framework data fully populated before removing fallback
+- Archive legacy storage only after extended validation period
 
 ## Success Criteria
 
